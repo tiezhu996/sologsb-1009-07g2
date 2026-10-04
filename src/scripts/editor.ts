@@ -32,6 +32,37 @@ interface ContentBlock {
   changeReason: string;
   reviewStatus: ReviewStatus;
   comments: CommentItem[];
+  /** 内容标识：由类型与正文归一化得到，用于跨版本对齐，与块 id 和位置无关。 */
+  contentKey: string;
+  /** 新修订内容是否已被编辑确认；未确认的块不进入导出。 */
+  confirmed: boolean;
+}
+
+type MergeItemKind = "same" | "changed" | "conflict" | "added" | "removed";
+
+interface MergePlanItem {
+  kind: MergeItemKind;
+  oldBlock?: ContentBlock;
+  newBlock?: ContentBlock;
+  conflictId?: string;
+}
+
+interface MergeConflict {
+  id: string;
+  oldBlock: ContentBlock;
+  newBlock: ContentBlock;
+  note: string;
+  resolution?: "old" | "new";
+}
+
+interface MergeSession {
+  id: string;
+  fileName: string;
+  startedAt: string;
+  plan: MergePlanItem[];
+  conflicts: MergeConflict[];
+  /** 旧稿独有块的处理决定：默认移除，可切换为保留。 */
+  removedDecisions: Record<string, "drop" | "keep">;
 }
 
 interface GlossaryTerm {
@@ -71,10 +102,36 @@ interface AccessibilityIssue {
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const SCHEMA_VERSION = 2;
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
+/** 内容标识：类型 + 归一化正文（标题含层级、图片含地址、链接含目标），与块 id、顺序无关。 */
+function blockKey(block: Pick<ContentBlock, "type" | "text" | "headingLevel" | "imageSrc" | "linkHref">) {
+  const base = `${block.type}|${block.text.replace(/\s+/g, "")}`;
+  if (block.type === "heading") return `${base}|H${block.headingLevel ?? 2}`;
+  if (block.type === "image") return `${base}|${block.imageSrc ?? ""}`;
+  if (block.type === "link") return `${base}|${block.linkHref ?? ""}`;
+  return base;
+}
+
+/** 旧版本数据升级：补齐内容标识、确认标记与批注数组，保持原有改写与审核状态。 */
+function migrateProject(raw: ChapterProject): ChapterProject {
+  const project: ChapterProject = {
+    ...raw,
+    glossary: raw.glossary ?? [],
+    versions: raw.versions ?? [],
+    blocks: (raw.blocks ?? []).map((block) => ({
+      ...block,
+      comments: block.comments ?? [],
+      confirmed: block.confirmed ?? true,
+      contentKey: block.contentKey ?? blockKey(block),
+    })),
+  };
+  return project;
+}
+
 function createSeedProject(): ChapterProject {
-  const blocks: ContentBlock[] = [
+  const blocks: Array<Omit<ContentBlock, "contentKey" | "confirmed">> = [
     {
       id: "block-h1",
       type: "heading",
@@ -160,7 +217,7 @@ function createSeedProject(): ChapterProject {
     title: "科学（五年级下册）·无障碍改写稿",
     subject: "科学",
     grade: "五年级",
-    blocks,
+    blocks: blocks.map((block) => ({ ...block, confirmed: true, contentKey: blockKey(block) })),
     glossary: [
       { id: "term-1", source: "水循环", preferred: "水循环", note: "全书统一使用" },
       { id: "term-2", source: "地表径流", preferred: "沿地面流动的水", note: "首次出现时使用通俗解释" },
@@ -205,7 +262,7 @@ function parseImportedChapter(input: string): ContentBlock[] {
 }
 
 function blankBlock(type: BlockType, text: string, extra: Partial<ContentBlock> = {}): ContentBlock {
-  return {
+  const block: ContentBlock = {
     id: uid("block"),
     type,
     text,
@@ -213,13 +270,122 @@ function blankBlock(type: BlockType, text: string, extra: Partial<ContentBlock> 
     changeReason: "",
     reviewStatus: "pending",
     comments: [],
+    confirmed: false,
+    contentKey: "",
     ...extra,
   };
+  block.contentKey = extra.contentKey ?? blockKey(block);
+  return block;
 }
 
 function sentenceLength(text: string) {
   const normalized = text.replace(/\s+/g, "");
   return /[A-Za-z]/.test(text) ? text.trim().split(/\s+/).length : normalized.length;
+}
+
+/** 二字组 Dice 相似度，用于在位置/类型对不上时猜测新旧块的对应关系。 */
+function textSimilarity(a: string, b: string) {
+  const na = a.replace(/\s+/g, "");
+  const nb = b.replace(/\s+/g, "");
+  if (!na.length || !nb.length) return 0;
+  if (na === nb) return 1;
+  const grams = (value: string) => {
+    const map = new Map<string, number>();
+    for (let index = 0; index < value.length - 1; index += 1) {
+      const gram = value.slice(index, index + 2);
+      map.set(gram, (map.get(gram) ?? 0) + 1);
+    }
+    return map;
+  };
+  const ga = grams(na);
+  const gb = grams(nb);
+  let overlap = 0;
+  ga.forEach((count, gram) => { overlap += Math.min(count, gb.get(gram) ?? 0); });
+  const total = Math.max(1, na.length - 1) + Math.max(1, nb.length - 1);
+  return (2 * overlap) / total;
+}
+
+/**
+ * 对齐新旧两稿：先按内容标识精确对齐（与位置无关），再按高相似度配对正文变化，
+ * 然后按同位置同类型兜底，剩下的用较低相似度配成待人工选择的冲突；
+ * 新稿独有为新增，旧稿独有为待移除。
+ */
+function planMerge(oldBlocks: ContentBlock[], newBlocks: ContentBlock[]): { plan: MergePlanItem[]; conflicts: MergeConflict[] } {
+  const usedOld = new Set<string>();
+  const slots: MergePlanItem[] = newBlocks.map((newBlock) => ({ kind: "added", newBlock }));
+
+  const byKey = new Map<string, ContentBlock[]>();
+  for (const oldBlock of oldBlocks) {
+    const queue = byKey.get(oldBlock.contentKey) ?? [];
+    queue.push(oldBlock);
+    byKey.set(oldBlock.contentKey, queue);
+  }
+  newBlocks.forEach((newBlock, index) => {
+    const match = byKey.get(newBlock.contentKey)?.find((oldBlock) => !usedOld.has(oldBlock.id));
+    if (match) {
+      usedOld.add(match.id);
+      slots[index] = { kind: "same", oldBlock: match, newBlock };
+    }
+  });
+
+  const bestMatch = (newBlock: ContentBlock) => {
+    let best: ContentBlock | null = null;
+    let bestScore = 0;
+    for (const oldBlock of oldBlocks) {
+      if (usedOld.has(oldBlock.id)) continue;
+      const score = textSimilarity(oldBlock.text, newBlock.text) + (oldBlock.type === newBlock.type ? 0.08 : 0);
+      if (score > bestScore) {
+        best = oldBlock;
+        bestScore = score;
+      }
+    }
+    return { best, bestScore };
+  };
+
+  // 高相似度 + 同类型：视为同一段落的正文修改，自动配对。
+  newBlocks.forEach((newBlock, index) => {
+    if (slots[index].kind !== "added") return;
+    const { best, bestScore } = bestMatch(newBlock);
+    if (best && best.type === newBlock.type && bestScore >= 0.6) {
+      usedOld.add(best.id);
+      slots[index] = { kind: "changed", oldBlock: best, newBlock };
+    }
+  });
+
+  // 同位置同类型：结构未重排时的兜底配对。
+  newBlocks.forEach((newBlock, index) => {
+    if (slots[index].kind !== "added") return;
+    const candidate = oldBlocks[index];
+    if (candidate && !usedOld.has(candidate.id) && candidate.type === newBlock.type) {
+      usedOld.add(candidate.id);
+      slots[index] = { kind: "changed", oldBlock: candidate, newBlock };
+    }
+  });
+
+  // 其余有一定相似度的配成冲突，交给编辑选择。
+  const conflicts: MergeConflict[] = [];
+  newBlocks.forEach((newBlock, index) => {
+    if (slots[index].kind !== "added") return;
+    const { best, bestScore } = bestMatch(newBlock);
+    if (best && bestScore > 0.34) {
+      usedOld.add(best.id);
+      const conflict: MergeConflict = {
+        id: uid("conflict"),
+        oldBlock: best,
+        newBlock,
+        note: best.type !== newBlock.type
+          ? `类型对不上：旧稿是「${best.type}」，新稿是「${newBlock.type}」`
+          : "位置对不上：内容相近但顺序或上下文已变化",
+      };
+      conflicts.push(conflict);
+      slots[index] = { kind: "conflict", oldBlock: best, newBlock, conflictId: conflict.id };
+    }
+  });
+
+  const removed: MergePlanItem[] = oldBlocks
+    .filter((oldBlock) => !usedOld.has(oldBlock.id))
+    .map((oldBlock) => ({ kind: "removed", oldBlock }));
+  return { plan: [...slots, ...removed], conflicts };
 }
 
 function analyze(project: ChapterProject): AccessibilityIssue[] {
@@ -388,26 +554,41 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
-function loadProject(): ChapterProject {
+interface StoredState {
+  project: ChapterProject;
+  mergeSession: MergeSession | null;
+}
+
+function loadStoredState(): StoredState {
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as {
+      schema: number;
+      project: ChapterProject;
+      mergeSession?: MergeSession | null;
+    };
+    if (stored.schema >= 1 && stored.schema <= SCHEMA_VERSION && stored.project?.blocks?.length) {
+      // 旧稿数据升级：schema 1 的块缺少内容标识与确认标记，由 migrateProject 补齐。
+      return { project: migrateProject(stored.project), mergeSession: stored.mergeSession ?? null };
+    }
   } catch {
     // Fall back to the bundled sample.
   }
-  return createSeedProject();
+  return { project: migrateProject(createSeedProject()), mergeSession: null };
 }
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("Application root was not found");
 const app: HTMLDivElement = rootElement;
 
-let project = loadProject();
+const storedState = loadStoredState();
+let project = storedState.project;
+let mergeSession: MergeSession | null = storedState.mergeSession;
 let activeBlockId = project.blocks[0]?.id ?? "";
 let activeIssueId = "";
 let previewMode: "normal" | "assisted" = "normal";
 let selectedVersionId = "";
 let showGlossary = false;
+let showMergePanel = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
@@ -415,11 +596,13 @@ let saveTimer = 0;
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
 
+function persistNow() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: SCHEMA_VERSION, project, mergeSession }));
+}
+
 function saveSoon() {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
-  }, 320);
+  saveTimer = window.setTimeout(persistNow, 320);
 }
 
 function commit(label: string, update: (draft: ChapterProject) => void, renderAfter = true) {
@@ -460,6 +643,103 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+/** 术语表变化后，只把正文中出现相关术语的段落退回待复核，返回受影响数量。 */
+function markGlossaryAffected(draft: ChapterProject, terms: Array<Pick<GlossaryTerm, "source" | "preferred">>) {
+  let affected = 0;
+  for (const block of draft.blocks) {
+    const haystack = `${block.text} ${block.accessibleText}`;
+    const hit = terms.some((term) =>
+      (term.source && haystack.includes(term.source)) || (term.preferred && haystack.includes(term.preferred)));
+    if (hit && block.reviewStatus !== "pending") {
+      block.reviewStatus = "pending";
+      affected += 1;
+    }
+  }
+  return affected;
+}
+
+function startMergeSession(fileName: string, text: string) {
+  const incoming = parseImportedChapter(text);
+  const { plan, conflicts } = planMerge(project.blocks, incoming);
+  mergeSession = {
+    id: uid("merge"),
+    fileName,
+    startedAt: new Date().toISOString(),
+    plan,
+    conflicts,
+    removedDecisions: {},
+  };
+  showMergePanel = true;
+  persistNow();
+  render();
+}
+
+/** 由合并计划生成新的块序列：正文变过的块保留批注但退回待复核，且标记为未确认。 */
+function buildMergedBlocks(session: MergeSession, previousBlocks: ContentBlock[]): ContentBlock[] {
+  const merged: ContentBlock[] = [];
+  for (const item of session.plan) {
+    if (item.kind === "same" && item.oldBlock) {
+      merged.push({ ...item.oldBlock, confirmed: true });
+    } else if (item.kind === "changed" && item.oldBlock && item.newBlock) {
+      merged.push({
+        ...item.oldBlock,
+        text: item.newBlock.text,
+        headingLevel: item.newBlock.headingLevel ?? item.oldBlock.headingLevel,
+        imageSrc: item.newBlock.imageSrc ?? item.oldBlock.imageSrc,
+        linkHref: item.newBlock.linkHref ?? item.oldBlock.linkHref,
+        contentKey: item.newBlock.contentKey,
+        reviewStatus: "pending",
+        confirmed: false,
+      });
+    } else if (item.kind === "added" && item.newBlock) {
+      merged.push({ ...item.newBlock, reviewStatus: "pending", confirmed: false });
+    } else if (item.kind === "conflict" && item.oldBlock && item.newBlock) {
+      const conflict = session.conflicts.find((entry) => entry.id === item.conflictId);
+      if (conflict?.resolution === "new") {
+        merged.push({
+          ...item.newBlock,
+          accessibleText: item.oldBlock.accessibleText,
+          changeReason: item.oldBlock.changeReason,
+          comments: item.oldBlock.comments,
+          reviewStatus: "pending",
+          confirmed: false,
+        });
+      } else {
+        merged.push({ ...item.oldBlock, confirmed: true });
+      }
+    }
+  }
+  for (const item of session.plan) {
+    if (item.kind !== "removed" || !item.oldBlock) continue;
+    if (session.removedDecisions[item.oldBlock.id] !== "keep") continue;
+    const originalIndex = previousBlocks.findIndex((block) => block.id === item.oldBlock?.id);
+    merged.splice(Math.min(Math.max(0, originalIndex), merged.length), 0, { ...item.oldBlock, confirmed: true });
+  }
+  return merged;
+}
+
+/** 应用合并：作为一个可撤销步骤写入。 */
+function applyMergeSession() {
+  const session = mergeSession;
+  if (!session || session.conflicts.some((conflict) => !conflict.resolution)) return;
+  const previousBlocks = project.blocks;
+  commit("合并新修订稿", (draft) => {
+    draft.blocks = buildMergedBlocks(session, previousBlocks);
+  });
+  if (!project.blocks.some((block) => block.id === activeBlockId)) activeBlockId = project.blocks[0]?.id ?? "";
+  mergeSession = null;
+  showMergePanel = false;
+  persistNow();
+  render();
+}
+
+function discardMergeSession() {
+  mergeSession = null;
+  showMergePanel = false;
+  persistNow();
+  render();
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
@@ -480,6 +760,7 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="default" data-action="import-revision">导入新修订稿</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
           <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
         </div>
@@ -495,6 +776,13 @@ function render() {
         </div>
       </div>
 
+      ${mergeSession && !showMergePanel ? `
+        <div class="merge-banner">
+          <span>新修订稿「${escapeHtml(mergeSession.fileName)}」合并进行中：${mergeSession.conflicts.filter((conflict) => !conflict.resolution).length} 处待选择，关闭页面也不会丢失。</span>
+          <sl-button size="small" variant="primary" data-action="open-merge">继续处理</sl-button>
+          <sl-button size="small" variant="text" data-action="discard-merge">放弃合并</sl-button>
+        </div>` : ""}
+
       <div class="workspace">
         <aside class="outline-panel">
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
@@ -505,11 +793,12 @@ function render() {
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
-                ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
+                ${block.confirmed === false ? `<em class="unconfirmed-tag">未确认</em>` : blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
           </div>
           <input id="chapter-file" type="file" accept=".txt,.md,.markdown" hidden />
+          <input id="revision-file" type="file" accept=".txt,.md,.markdown" hidden />
           <sl-button class="import-button" variant="default" data-action="import">导入章节文本</sl-button>
           <div class="keyboard-note"><b>键盘</b><span><kbd>J</kbd><kbd>K</kbd> 跳转问题</span><span><kbd>E</kbd> 自动改写</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>1</kbd><kbd>2</kbd> 预览模式</span></div>
         </aside>
@@ -518,6 +807,7 @@ function render() {
           <div class="editor-head">
             <div><span class="eyebrow">当前内容块</span><h1>${blockRole(active)}</h1></div>
             <div class="review-actions">
+              ${active.confirmed === false ? `<sl-button size="small" variant="primary" data-action="confirm-block">确认采用新修订</sl-button>` : ""}
               <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
@@ -598,7 +888,9 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
-    </sl-dialog>`;
+    </sl-dialog>
+
+    ${mergeSession ? renderMergeDialog(mergeSession, showMergePanel) : ""}`;
 
   wireLiveFields();
 }
@@ -646,6 +938,61 @@ function renderVersionDiff(version: VersionSnapshot, current: ContentBlock) {
   const oldBlock = version.blocks.find((block) => block.id === current.id);
   if (!oldBlock) return `<div class="empty-note">当前内容块不在该版本中。</div>`;
   return `<div class="diff-column"><span>旧版</span><p>${escapeHtml(oldBlock.accessibleText || oldBlock.text)}</p></div><div class="diff-column current"><span>当前</span><p>${escapeHtml(current.accessibleText || current.text)}</p></div>`;
+}
+
+function mergeBlockSummary(block: ContentBlock) {
+  const role = block.type === "heading" ? `H${block.headingLevel ?? 2}` : blockRole(block);
+  return `<b>${role}</b><span>${escapeHtml(block.text || "（空）")}</span>`;
+}
+
+function renderMergeDialog(session: MergeSession, open: boolean) {
+  const sameCount = session.plan.filter((item) => item.kind === "same").length;
+  const changed = session.plan.filter((item) => item.kind === "changed");
+  const added = session.plan.filter((item) => item.kind === "added");
+  const removed = session.plan.filter((item) => item.kind === "removed");
+  const unresolved = session.conflicts.filter((conflict) => !conflict.resolution).length;
+  return `
+    <sl-dialog label="合并新修订稿" ${open ? "open" : ""} class="merge-dialog" data-dialog="merge">
+      <p class="merge-intro">来自「${escapeHtml(session.fileName)}」的新稿已按内容标识与旧稿对齐。正文变过的块会保留批注但退回待复核；位置或类型对不上的块需要逐条选择。所有选择会自动保存，关闭页面后可继续。</p>
+      <div class="merge-summary">
+        <span>✓ 内容一致 ${sameCount}</span>
+        <span>✎ 正文有变化 ${changed.length}</span>
+        <span>＋ 新稿新增 ${added.length}</span>
+        <span>－ 旧稿独有 ${removed.length}</span>
+        <span class="${unresolved ? "pending" : "done"}">${unresolved ? `？ 待选择 ${unresolved}` : "✓ 冲突均已选择"}</span>
+      </div>
+
+      ${changed.length ? `<section class="merge-group"><h3>正文有变化 · 保留批注并退回待复核</h3>${changed.map((item) => `
+        <div class="merge-row"><div class="merge-side">${mergeBlockSummary(item.oldBlock!)}</div><div class="merge-arrow">→</div><div class="merge-side new">${mergeBlockSummary(item.newBlock!)}</div></div>`).join("")}</section>` : ""}
+
+      ${session.conflicts.length ? `<section class="merge-group"><h3>位置或类型对不上 · 请选择保留哪一边</h3>${session.conflicts.map((conflict) => `
+        <div class="merge-conflict ${conflict.resolution ? "resolved" : ""}">
+          <small>${escapeHtml(conflict.note)}</small>
+          <div class="merge-row">
+            <button class="merge-side pick ${conflict.resolution === "old" ? "chosen" : ""}" data-action="resolve-conflict" data-conflict-id="${conflict.id}" data-choice="old">
+              <b>保留旧稿</b>${mergeBlockSummary(conflict.oldBlock)}${conflict.oldBlock.comments.length ? `<i>${conflict.oldBlock.comments.length} 条批注随之保留</i>` : ""}
+            </button>
+            <button class="merge-side pick ${conflict.resolution === "new" ? "chosen" : ""}" data-action="resolve-conflict" data-conflict-id="${conflict.id}" data-choice="new">
+              <b>采用新稿</b>${mergeBlockSummary(conflict.newBlock)}<i>旧稿批注与改写会转移过来，状态退回待复核</i>
+            </button>
+          </div>
+        </div>`).join("")}</section>` : ""}
+
+      ${added.length ? `<section class="merge-group"><h3>新稿新增 · 导入后需确认才会导出</h3>${added.map((item) => `
+        <div class="merge-row single"><div class="merge-side new">${mergeBlockSummary(item.newBlock!)}</div></div>`).join("")}</section>` : ""}
+
+      ${removed.length ? `<section class="merge-group"><h3>旧稿独有 · 新稿中已没有</h3>${removed.map((item) => {
+        const decision = session.removedDecisions[item.oldBlock!.id] ?? "drop";
+        return `<div class="merge-row"><div class="merge-side ${decision === "keep" ? "" : "dimmed"}">${mergeBlockSummary(item.oldBlock!)}${item.oldBlock!.comments.length ? `<i>${item.oldBlock!.comments.length} 条批注</i>` : ""}</div>
+          <sl-button size="small" variant="${decision === "keep" ? "primary" : "default"}" outline data-action="toggle-removed" data-block-id="${item.oldBlock!.id}">${decision === "keep" ? "✓ 保留此块" : "保留此块"}</sl-button></div>`;
+      }).join("")}</section>` : ""}
+
+      <div slot="footer" class="merge-footer">
+        <sl-button variant="text" data-action="discard-merge">放弃合并</sl-button>
+        <sl-button variant="default" data-action="close-merge">稍后继续</sl-button>
+        <sl-button variant="primary" data-action="apply-merge" ${unresolved ? "disabled" : ""}>${unresolved ? `还有 ${unresolved} 处待选择` : "应用合并（可撤销）"}</sl-button>
+      </div>
+    </sl-dialog>`;
 }
 
 function wireLiveFields() {
@@ -701,7 +1048,7 @@ app.addEventListener("click", (event) => {
       current.reviewStatus = "pending";
     }, "生成易读版本");
   }
-  if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
+  if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; block.confirmed = true; }, "审核通过");
   if (action === "needs-work") updateActiveBlock((block) => { block.reviewStatus = "needs-work"; }, "标记需修改");
   if (action === "add-comment") {
     const input = app.querySelector<HTMLElement & { value: string }>("#new-comment");
@@ -733,12 +1080,26 @@ app.addEventListener("click", (event) => {
     const source = app.querySelector<HTMLElement & { value: string }>("#new-term-source");
     const preferred = app.querySelector<HTMLElement & { value: string }>("#new-term-preferred");
     if (source?.value.trim() && preferred?.value.trim()) {
-      commit("添加术语", (draft) => { draft.glossary.push({ id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" }); });
+      const term = { id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" };
+      let affected = 0;
+      commit("添加术语", (draft) => {
+        draft.glossary.push(term);
+        affected = markGlossaryAffected(draft, [term]);
+      });
+      document.documentElement.dataset.lastAction = affected ? `添加术语，${affected} 个相关段落退回待复核` : "添加术语";
+      render();
     }
   }
   if (action === "remove-term") {
     const termId = target.dataset.termId;
-    commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
+    const removedTerm = project.glossary.find((term) => term.id === termId);
+    let affected = 0;
+    commit("删除术语", (draft) => {
+      draft.glossary = draft.glossary.filter((term) => term.id !== termId);
+      if (removedTerm) affected = markGlossaryAffected(draft, [removedTerm]);
+    });
+    document.documentElement.dataset.lastAction = affected ? `删除术语，${affected} 个相关段落退回待复核` : "删除术语";
+    render();
   }
   if (action === "save-version") {
     const versionId = uid("version");
@@ -750,14 +1111,45 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "approve-all") {
-    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
+    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; block.confirmed = true; }); });
   }
   if (action === "export") {
-    download(`${project.title}-无障碍版.html`, exportHtml(project));
-    document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
+    const confirmedBlocks = project.blocks.filter((block) => block.confirmed !== false);
+    const skipped = project.blocks.length - confirmedBlocks.length;
+    if (!confirmedBlocks.length) {
+      document.documentElement.dataset.lastAction = "没有已确认的内容，无法导出";
+    } else {
+      download(`${project.title}-无障碍版.html`, exportHtml({ ...project, blocks: confirmedBlocks }));
+      document.documentElement.dataset.lastAction = skipped
+        ? `已导出无障碍 HTML（仅含已确认内容，跳过 ${skipped} 个未确认块）`
+        : "已导出无障碍 HTML";
+    }
     render();
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
+  if (action === "import-revision") app.querySelector<HTMLInputElement>("#revision-file")?.click();
+  if (action === "open-merge") { showMergePanel = true; render(); }
+  if (action === "close-merge") { showMergePanel = false; persistNow(); render(); }
+  if (action === "discard-merge") discardMergeSession();
+  if (action === "apply-merge") applyMergeSession();
+  if (action === "resolve-conflict" && mergeSession) {
+    const conflict = mergeSession.conflicts.find((item) => item.id === target.dataset.conflictId);
+    const choice = target.dataset.choice;
+    if (conflict && (choice === "old" || choice === "new")) {
+      conflict.resolution = choice;
+      persistNow();
+      render();
+    }
+  }
+  if (action === "toggle-removed" && mergeSession) {
+    const blockId = target.dataset.blockId ?? "";
+    mergeSession.removedDecisions[blockId] = mergeSession.removedDecisions[blockId] === "keep" ? "drop" : "keep";
+    persistNow();
+    render();
+  }
+  if (action === "confirm-block") {
+    updateActiveBlock((block) => { block.confirmed = true; }, "确认采用新修订内容");
+  }
 });
 
 app.addEventListener("sl-change", (event) => {
@@ -774,20 +1166,41 @@ app.addEventListener("sl-change", (event) => {
   if (element.matches("[data-term-id]")) {
     const termId = element.dataset.termId;
     const value = (element as HTMLElement & { value: string }).value;
-    commit("修改术语表", (draft) => { const term = draft.glossary.find((item) => item.id === termId); if (term) term.preferred = value; });
+    const before = project.glossary.find((term) => term.id === termId);
+    let affected = 0;
+    commit("修改术语表", (draft) => {
+      const term = draft.glossary.find((item) => item.id === termId);
+      if (term) {
+        term.preferred = value;
+        affected = markGlossaryAffected(draft, [
+          { source: term.source, preferred: value },
+          ...(before && before.preferred !== value ? [{ source: before.source, preferred: before.preferred }] : []),
+        ]);
+      }
+    });
+    document.documentElement.dataset.lastAction = affected ? `术语变更，${affected} 个相关段落退回待复核` : "修改术语表";
+    render();
   }
 });
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
-  if (input.id !== "chapter-file" || !input.files?.[0]) return;
-  void input.files[0].text().then((text) => {
-    commit("导入章节文本", (draft) => {
-      draft.blocks = parseImportedChapter(text);
-      activeBlockId = draft.blocks[0]?.id ?? "";
-      activeIssueId = "";
+  if (!input.files?.[0]) return;
+  if (input.id === "chapter-file") {
+    void input.files[0].text().then((text) => {
+      commit("导入章节文本", (draft) => {
+        draft.blocks = parseImportedChapter(text).map((block) => ({ ...block, confirmed: true }));
+        activeBlockId = draft.blocks[0]?.id ?? "";
+        activeIssueId = "";
+      });
     });
-  });
+    input.value = "";
+  }
+  if (input.id === "revision-file") {
+    const file = input.files[0];
+    void file.text().then((text) => startMergeSession(file.name, text));
+    input.value = "";
+  }
 });
 
 app.addEventListener("input", (event) => {
@@ -800,6 +1213,15 @@ app.addEventListener("input", (event) => {
 
 window.addEventListener("online", render);
 window.addEventListener("offline", render);
+window.addEventListener("beforeunload", persistNow);
+app.addEventListener("sl-hide", (event) => {
+  const dialog = (event.target as HTMLElement).closest("[data-dialog]");
+  if (dialog?.getAttribute("data-dialog") === "merge") {
+    showMergePanel = false;
+    persistNow();
+  }
+  if (dialog?.getAttribute("data-dialog") === "glossary") showGlossary = false;
+});
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement;
   if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
