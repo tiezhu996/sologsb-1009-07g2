@@ -166,6 +166,37 @@ sl-textarea::part(textarea) { line-height: 1.65; }
 ::-webkit-scrollbar-thumb { background: #b9c2bd; border: 3px solid transparent; border-radius: 99px; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
+.merge-banner { display: flex; align-items: center; gap: 10px; padding: 9px 20px; background: #fff3d8; color: #714908; border-bottom: 1px solid #e8c985; font-size: 11px; }
+.merge-banner b { color: #8a5209; }
+.merge-banner span { flex: 1; }
+.recheck-banner { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid #e8c985; border-left: 4px solid #c78316; border-radius: 9px; background: #fff9ed; color: #68450a; font-size: 11px; }
+.recheck-banner.added { border-color: #b9d2e6; border-left-color: #1b6ca8; background: #f4faff; color: #174d77; }
+.recheck-banner b { white-space: nowrap; }
+.recheck-banner span { flex: 1; line-height: 1.5; }
+.block-item.revision-changed { border-color: #e6c589; }
+.block-item.revision-added { border-color: #a9c8de; }
+.merge-dialog { --width: min(1080px, 94vw); }
+.merge-summary { display: grid; grid-template-columns: auto auto auto 1fr; gap: 8px; align-items: center; margin-bottom: 10px; font-size: 11px; }
+.merge-summary span { background: #eef3f1; border-radius: 99px; padding: 5px 9px; color: #51605a; }
+.merge-summary b.pending { color: #9a6115; justify-self: end; }
+.merge-summary b.ready { color: #26704f; justify-self: end; }
+.merge-actions-row { display: flex; justify-content: space-between; margin-bottom: 10px; }
+.merge-pending-list { display: grid; gap: 10px; max-height: 56vh; overflow-y: auto; padding-right: 4px; }
+.merge-row { border: 1px solid #dfe4e1; border-radius: 11px; padding: 10px; background: #fcfcf9; }
+.merge-row header { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.merge-row header small { color: #806332; font-size: 10px; }
+.merge-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.merge-card { display: grid; gap: 5px; border: 1px solid #d9dfdb; border-radius: 8px; padding: 9px; background: #fff; min-width: 0; }
+.merge-card b { font-size: 9px; letter-spacing: .06em; text-transform: uppercase; color: #65726c; }
+.merge-card span { font-size: 12px; line-height: 1.55; color: #263530; }
+.merge-card small { font-size: 10px; color: #7a867f; }
+.merge-card.missing { border-style: dashed; color: #87918b; background: #f7f8f5; }
+.merge-row > small { display: block; color: #7b8680; font-size: 10px; margin-top: 5px; }
+.merge-automatic { margin-top: 12px; font-size: 11px; color: #65716b; }
+.merge-auto-row { display: grid; grid-template-columns: 60px 1fr 20px 1fr; gap: 6px; align-items: center; padding: 6px 0; border-bottom: 1px solid #edf0ed; }
+.merge-auto-row b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.merge-auto-row i { text-align: center; font-style: normal; }
+
 @media (max-width: 1400px) {
   .workspace { grid-template-columns: 245px minmax(520px, 1fr) 370px; }
   .online-pill { display: none; }
